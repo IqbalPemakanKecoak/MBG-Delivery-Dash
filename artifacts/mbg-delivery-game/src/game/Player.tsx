@@ -1,10 +1,17 @@
 /**
- * Player.tsx
- * Controls the motorbike player:
- *  • WASD / arrow keys for movement via @react-three/drei KeyboardControls
- *  • AABB collision detection against buildings
- *  • Third-person follow camera
- *  • Delivery trigger when within 3 units of a school checkpoint
+ * Player.tsx — Delivery Truck
+ *
+ * WHY W WAS BACKWARDS:
+ * The truck model's cabin faced local +Z, but movement used direction (-sin, 0, -cos)
+ * which is -Z when yaw=0. The truck was driving tail-first.
+ * FIX: wrap all mesh parts in an inner <group rotation-y={Math.PI}>. This spins the
+ * visual model 180° so the cabin now faces -Z = the actual movement direction.
+ * The physics group (groupRef) remains untouched — position and yaw are still correct.
+ *
+ * HEADLIGHTS:
+ * Two SpotLights live inside the rotated model group as children. Because they are
+ * child objects they automatically move and rotate with the truck. Their target groups
+ * are also children placed far ahead in model space, so the beams always point forward.
  */
 import { useRef, useEffect } from 'react';
 import { useFrame } from '@react-three/fiber';
@@ -21,35 +28,35 @@ export enum Controls {
   right   = 'right',
 }
 
-// ── Constants ────────────────────────────────────────────────────────────────
-const SPEED       = 18;   // units/s
-const TURN_SPEED  = 2.0;  // rad/s
-const DELIVER_R   = 4.0;  // delivery trigger radius (units)
-const MAP_LIMIT   = 65;   // keep player within ±65 on X and Z
+// ── Truck constants ───────────────────────────────────────────────────────────
+const SPEED      = 12;   // units/s – slower than a motorbike
+const REVERSE    = 6;    // reverse speed
+const TURN_SPEED = 1.4;  // rad/s – wide turns like a real truck
+const ACCEL      = 4;    // acceleration smoothing factor
+const DELIVER_R  = 5.0;  // delivery trigger radius (units)
+const MAP_LIMIT  = 65;
 
-// Pre-build AABBs once (same each frame – stable ref)
+// Pre-build AABBs once — stable ref, never rebuilt
 const BUILDING_AABBS: AABB[] = computeBuildingAABBs();
 
-// ── Collision helper ─────────────────────────────────────────────────────────
-function resolveCollision(pos: THREE.Vector3, radius = 1.2): THREE.Vector3 {
+// ── AABB collision resolver ───────────────────────────────────────────────────
+function resolveCollision(pos: THREE.Vector3, radius = 1.8): THREE.Vector3 {
   const out = pos.clone();
   for (const box of BUILDING_AABBS) {
     const inX = out.x > box.minX && out.x < box.maxX;
     const inZ = out.z > box.minZ && out.z < box.maxZ;
     if (inX && inZ) {
-      // Push out along the shallowest axis
-      const dLeft  = Math.abs(out.x - box.minX);
-      const dRight = Math.abs(out.x - box.maxX);
-      const dFront = Math.abs(out.z - box.minZ);
-      const dBack  = Math.abs(out.z - box.maxZ);
-      const minD   = Math.min(dLeft, dRight, dFront, dBack);
-      if (minD === dLeft)  out.x = box.minX - radius;
-      else if (minD === dRight) out.x = box.maxX + radius;
-      else if (minD === dFront) out.z = box.minZ - radius;
-      else                      out.z = box.maxZ + radius;
+      const dL = Math.abs(out.x - box.minX);
+      const dR = Math.abs(out.x - box.maxX);
+      const dF = Math.abs(out.z - box.minZ);
+      const dB = Math.abs(out.z - box.maxZ);
+      const m  = Math.min(dL, dR, dF, dB);
+      if (m === dL)      out.x = box.minX - radius;
+      else if (m === dR) out.x = box.maxX + radius;
+      else if (m === dF) out.z = box.minZ - radius;
+      else               out.z = box.maxZ + radius;
     }
   }
-  // Map boundary clamp
   out.x = THREE.MathUtils.clamp(out.x, -MAP_LIMIT, MAP_LIMIT);
   out.z = THREE.MathUtils.clamp(out.z, -MAP_LIMIT, MAP_LIMIT);
   return out;
@@ -58,23 +65,56 @@ function resolveCollision(pos: THREE.Vector3, radius = 1.2): THREE.Vector3 {
 // ── Props ─────────────────────────────────────────────────────────────────────
 interface PlayerProps {
   positionRef: React.MutableRefObject<THREE.Vector3>;
+  yawRef:      React.MutableRefObject<number>;
 }
 
-// ── Player component ─────────────────────────────────────────────────────────
-export function Player({ positionRef }: PlayerProps) {
-  const groupRef   = useRef<THREE.Group>(null);
-  const wheelFRef  = useRef<THREE.Mesh>(null);
-  const wheelBRef  = useRef<THREE.Mesh>(null);
-  const velRef     = useRef(0);           // current forward speed
-  const yawRef     = useRef(0);           // facing angle (radians)
+// ── Truck wheel helper ────────────────────────────────────────────────────────
+function Wheel({ x, z }: { x: number; z: number }) {
+  const ref = useRef<THREE.Group>(null);
+  // expose to parent via userData for spin access
+  return (
+    <group ref={ref} position={[x, 0.55, z]} userData={{ wheelGroup: true }}>
+      {/* Tyre */}
+      <mesh rotation={[0, 0, Math.PI / 2]} castShadow>
+        <cylinderGeometry args={[0.55, 0.55, 0.42, 14]} />
+        <meshLambertMaterial color="#1a1a1a" />
+      </mesh>
+      {/* Hub */}
+      <mesh rotation={[0, 0, Math.PI / 2]}>
+        <cylinderGeometry args={[0.28, 0.28, 0.44, 8]} />
+        <meshLambertMaterial color="#bdbdbd" />
+      </mesh>
+    </group>
+  );
+}
+
+// ── Main player component ─────────────────────────────────────────────────────
+export function Player({ positionRef, yawRef }: PlayerProps) {
+  const groupRef     = useRef<THREE.Group>(null);   // physics group
+  const modelRef     = useRef<THREE.Group>(null);   // visual model (rotated π)
+  const velRef       = useRef(0);                   // current speed
+
+  // Headlight targets — must be in scene as Objects so SpotLight.target works
+  const targetLRef   = useRef<THREE.Group>(null);
+  const targetRRef   = useRef<THREE.Group>(null);
+  const headLRef     = useRef<THREE.SpotLight>(null);
+  const headRRef     = useRef<THREE.SpotLight>(null);
 
   const [, getKeys] = useKeyboardControls<Controls>();
   const { phase, schools, deliverPackage } = useGameStore();
 
-  // Sync positionRef on mount
+  // Wire SpotLight targets after mount
+  useEffect(() => {
+    if (headLRef.current && targetLRef.current)
+      headLRef.current.target = targetLRef.current;
+    if (headRRef.current && targetRRef.current)
+      headRRef.current.target = targetRRef.current;
+  }, []);
+
   useEffect(() => {
     positionRef.current.set(0, 0, 0);
-  }, [positionRef]);
+    yawRef.current = 0;
+  }, [positionRef, yawRef]);
 
   useFrame((state, delta) => {
     if (phase !== 'playing') return;
@@ -83,36 +123,47 @@ export function Player({ positionRef }: PlayerProps) {
 
     const keys = getKeys();
 
-    // ── Rotation ──────────────────────────────────────────────────────────
-    if (keys.left)  yawRef.current += TURN_SPEED * delta;
-    if (keys.right) yawRef.current -= TURN_SPEED * delta;
+    // ── Turn (only while moving for realism) ────────────────────────────────
+    const moving = Math.abs(velRef.current) > 0.3;
+    if (moving) {
+      // Turn direction flips when reversing (natural steering)
+      const dir = velRef.current > 0 ? 1 : -1;
+      if (keys.left)  yawRef.current += TURN_SPEED * delta * dir;
+      if (keys.right) yawRef.current -= TURN_SPEED * delta * dir;
+    }
 
-    // ── Acceleration ──────────────────────────────────────────────────────
-    const targetSpeed = keys.forward ? SPEED : keys.back ? -SPEED * 0.5 : 0;
-    velRef.current += (targetSpeed - velRef.current) * Math.min(1, delta * 6);
+    // ── Throttle & brake ────────────────────────────────────────────────────
+    const target = keys.forward ? SPEED : keys.back ? -REVERSE : 0;
+    velRef.current += (target - velRef.current) * Math.min(1, delta * ACCEL);
 
-    // ── Move ──────────────────────────────────────────────────────────────
-    const dir = new THREE.Vector3(
+    // ── Movement direction: -Z when yaw=0 = FORWARD ─────────────────────────
+    // After rotating the model by π the cabin faces this direction.
+    const fwd = new THREE.Vector3(
       -Math.sin(yawRef.current),
       0,
       -Math.cos(yawRef.current),
     );
-    const candidate = group.position.clone().addScaledVector(dir, velRef.current * delta);
+    const candidate = group.position.clone().addScaledVector(fwd, velRef.current * delta);
     candidate.y = 0;
-    const resolved  = resolveCollision(candidate);
+    const resolved = resolveCollision(candidate);
 
     group.position.copy(resolved);
     group.rotation.y = yawRef.current;
 
-    // ── Wheel spin ────────────────────────────────────────────────────────
-    const spin = (velRef.current / 1.2) * delta;
-    if (wheelFRef.current) wheelFRef.current.rotation.x += spin;
-    if (wheelBRef.current) wheelBRef.current.rotation.x += spin;
-
-    // ── Expose position for sound/delivery checks ─────────────────────────
+    // ── Expose shared state ──────────────────────────────────────────────────
     positionRef.current.copy(resolved);
 
-    // ── Delivery trigger ──────────────────────────────────────────────────
+    // ── Camera: placed BEHIND the truck (opposite of forward dir) ───────────
+    // Behind = +Z when yaw=0, which is +sin, +cos
+    const camOffset = new THREE.Vector3(
+      Math.sin(yawRef.current) * 16,
+      8,
+      Math.cos(yawRef.current) * 16,
+    );
+    state.camera.position.lerp(resolved.clone().add(camOffset), 0.07);
+    state.camera.lookAt(resolved.x, 2.0, resolved.z);
+
+    // ── Delivery check ───────────────────────────────────────────────────────
     for (const school of schools) {
       if (school.delivered) continue;
       const dx = resolved.x - school.position[0];
@@ -121,86 +172,144 @@ export function Player({ positionRef }: PlayerProps) {
         deliverPackage(school.id);
       }
     }
-
-    // ── Camera follow ─────────────────────────────────────────────────────
-    const camOffset = new THREE.Vector3(
-      Math.sin(yawRef.current) * 14,
-      7,
-      Math.cos(yawRef.current) * 14,
-    );
-    const camTarget = resolved.clone().add(camOffset);
-    state.camera.position.lerp(camTarget, 0.08);
-    state.camera.lookAt(resolved.x, 1.5, resolved.z);
   });
 
   return (
+    // Physics / transform group — only position + rotation.y are set here
     <group ref={groupRef} position={[0, 0, 0]}>
-      {/* ── Body ── */}
-      <mesh position={[0, 0.7, 0]} castShadow>
-        <boxGeometry args={[0.7, 0.5, 1.8]} />
-        <meshLambertMaterial color="#1565c0" />
-      </mesh>
 
-      {/* ── Fuel box / cargo */}
-      <mesh position={[0, 1.0, 0.3]} castShadow>
-        <boxGeometry args={[0.55, 0.45, 0.9]} />
-        <meshLambertMaterial color="#0d47a1" />
-      </mesh>
+      {/*
+       * Visual model group — rotated Math.PI so the CABIN (at local +Z)
+       * ends up facing the actual movement direction (-Z world when yaw=0).
+       * ALL meshes and lights live inside this group.
+       */}
+      <group ref={modelRef} rotation={[0, Math.PI, 0]}>
 
-      {/* ── Delivery box ── */}
-      <mesh position={[0, 1.2, -0.6]} castShadow>
-        <boxGeometry args={[0.6, 0.5, 0.6]} />
-        <meshLambertMaterial color="#ffffff" />
-      </mesh>
-      {/* Box lid */}
-      <mesh position={[0, 1.47, -0.6]}>
-        <boxGeometry args={[0.62, 0.05, 0.62]} />
-        <meshLambertMaterial color="#e3f2fd" />
-      </mesh>
+        {/* ── Chassis / frame ── */}
+        <mesh position={[0, 0.32, 0]} castShadow receiveShadow>
+          <boxGeometry args={[3.0, 0.45, 8.5]} />
+          <meshLambertMaterial color="#263238" />
+        </mesh>
 
-      {/* ── Rider helmet ── */}
-      <mesh position={[0, 1.45, 0.55]} castShadow>
-        <sphereGeometry args={[0.28, 10, 10]} />
-        <meshLambertMaterial color="#4caf50" />
-      </mesh>
+        {/* ── Cargo box (rear) ── */}
+        <mesh position={[0, 2.0, -1.6]} castShadow>
+          <boxGeometry args={[3.0, 3.2, 5.0]} />
+          <meshLambertMaterial color="#ffffff" />
+        </mesh>
+        {/* BPGN logo stripe */}
+        <mesh position={[0, 2.0, -4.11]}>
+          <boxGeometry args={[2.8, 1.0, 0.04]} />
+          <meshLambertMaterial color="#1565c0" />
+        </mesh>
+        {/* Cargo door lines */}
+        <mesh position={[0, 0.58, -4.12]}>
+          <boxGeometry args={[2.9, 0.06, 0.04]} />
+          <meshLambertMaterial color="#bdbdbd" />
+        </mesh>
+        <mesh position={[0, 3.42, -4.12]}>
+          <boxGeometry args={[2.9, 0.06, 0.04]} />
+          <meshLambertMaterial color="#bdbdbd" />
+        </mesh>
 
-      {/* ── Handlebars ── */}
-      <mesh position={[0, 0.95, 0.9]}>
-        <boxGeometry args={[0.9, 0.06, 0.06]} />
-        <meshLambertMaterial color="#424242" />
-      </mesh>
+        {/* ── Cabin (front) ── */}
+        <mesh position={[0, 1.7, 2.8]} castShadow>
+          <boxGeometry args={[3.0, 2.8, 2.4]} />
+          <meshLambertMaterial color="#1565c0" />
+        </mesh>
+        {/* Windshield */}
+        <mesh position={[0, 2.4, 4.01]}>
+          <boxGeometry args={[2.4, 1.2, 0.06]} />
+          <meshLambertMaterial color="#b3e5fc" transparent opacity={0.7} />
+        </mesh>
+        {/* Cabin roof visor */}
+        <mesh position={[0, 3.3, 3.5]}>
+          <boxGeometry args={[3.1, 0.2, 1.6]} />
+          <meshLambertMaterial color="#0d47a1" />
+        </mesh>
+        {/* Front bumper */}
+        <mesh position={[0, 0.6, 4.05]}>
+          <boxGeometry args={[3.1, 0.5, 0.2]} />
+          <meshLambertMaterial color="#9e9e9e" />
+        </mesh>
+        {/* Headlight housings */}
+        <mesh position={[-0.9, 1.2, 4.01]}>
+          <boxGeometry args={[0.7, 0.35, 0.06]} />
+          <meshBasicMaterial color="#fffde7" />
+        </mesh>
+        <mesh position={[0.9, 1.2, 4.01]}>
+          <boxGeometry args={[0.7, 0.35, 0.06]} />
+          <meshBasicMaterial color="#fffde7" />
+        </mesh>
+        {/* Side mirrors */}
+        <mesh position={[-1.65, 2.6, 3.2]}>
+          <boxGeometry args={[0.3, 0.18, 0.5]} />
+          <meshLambertMaterial color="#37474f" />
+        </mesh>
+        <mesh position={[1.65, 2.6, 3.2]}>
+          <boxGeometry args={[0.3, 0.18, 0.5]} />
+          <meshLambertMaterial color="#37474f" />
+        </mesh>
+        {/* Exhaust stack */}
+        <mesh position={[-1.6, 3.6, 1.5]}>
+          <cylinderGeometry args={[0.1, 0.1, 2.5, 7]} />
+          <meshLambertMaterial color="#616161" />
+        </mesh>
 
-      {/* ── Front wheel ── */}
-      <mesh ref={wheelFRef} position={[0, 0.28, 0.9]} rotation={[0, 0, Math.PI / 2]}>
-        <cylinderGeometry args={[0.28, 0.28, 0.14, 14]} />
-        <meshLambertMaterial color="#212121" />
-      </mesh>
-      <mesh position={[0, 0.28, 0.9]} rotation={[0, 0, Math.PI / 2]}>
-        <cylinderGeometry args={[0.16, 0.16, 0.16, 8]} />
-        <meshLambertMaterial color="#757575" />
-      </mesh>
+        {/* ── Wheels (6-wheel truck) ── */}
+        <Wheel x={-1.7} z={ 3.0} />  {/* front-left  */}
+        <Wheel x={ 1.7} z={ 3.0} />  {/* front-right */}
+        <Wheel x={-1.7} z={-1.0} />  {/* mid-left    */}
+        <Wheel x={ 1.7} z={-1.0} />  {/* mid-right   */}
+        <Wheel x={-1.7} z={-3.5} />  {/* rear-left   */}
+        <Wheel x={ 1.7} z={-3.5} />  {/* rear-right  */}
 
-      {/* ── Rear wheel ── */}
-      <mesh ref={wheelBRef} position={[0, 0.28, -0.9]} rotation={[0, 0, Math.PI / 2]}>
-        <cylinderGeometry args={[0.28, 0.28, 0.14, 14]} />
-        <meshLambertMaterial color="#212121" />
-      </mesh>
-      <mesh position={[0, 0.28, -0.9]} rotation={[0, 0, Math.PI / 2]}>
-        <cylinderGeometry args={[0.16, 0.16, 0.16, 8]} />
-        <meshLambertMaterial color="#757575" />
-      </mesh>
+        {/*
+         * ── Headlights ──
+         * SpotLights are children of the model group, so they move with the truck.
+         * target groups placed far forward (local +Z) tell the lights where to shine.
+         * After the model's Math.PI rotation, local +Z = world -Z = forward. ✓
+         */}
+        <spotLight
+          ref={headLRef}
+          position={[-0.9, 1.2, 4.1]}
+          angle={0.35}
+          penumbra={0.5}
+          intensity={6}
+          color="#fffde7"
+          distance={50}
+          castShadow
+          shadow-mapSize={[512, 512]}
+        />
+        {/* Left headlight target — far ahead in local +Z */}
+        <group ref={targetLRef} position={[-0.9, 0, 20]} />
 
-      {/* ── Exhaust pipe ── */}
-      <mesh position={[0.36, 0.4, -0.6]} rotation={[0, 0, Math.PI / 2]}>
-        <cylinderGeometry args={[0.06, 0.06, 0.5, 6]} />
-        <meshLambertMaterial color="#9e9e9e" />
-      </mesh>
+        <spotLight
+          ref={headRRef}
+          position={[0.9, 1.2, 4.1]}
+          angle={0.35}
+          penumbra={0.5}
+          intensity={6}
+          color="#fffde7"
+          distance={50}
+          castShadow
+          shadow-mapSize={[512, 512]}
+        />
+        {/* Right headlight target */}
+        <group ref={targetRRef} position={[0.9, 0, 20]} />
 
-      {/* ── Headlight ── */}
-      <mesh position={[0, 0.8, 1.0]}>
-        <sphereGeometry args={[0.12, 8, 8]} />
-        <meshBasicMaterial color="#fffde7" />
-      </mesh>
+        {/* Tail lights glow */}
+        <pointLight position={[-1.0, 1.2, -4.2]} color="#ef5350" intensity={1.5} distance={6} />
+        <pointLight position={[ 1.0, 1.2, -4.2]} color="#ef5350" intensity={1.5} distance={6} />
+        <mesh position={[-1.0, 1.2, -4.12]}>
+          <boxGeometry args={[0.5, 0.25, 0.04]} />
+          <meshBasicMaterial color="#ef5350" />
+        </mesh>
+        <mesh position={[1.0, 1.2, -4.12]}>
+          <boxGeometry args={[0.5, 0.25, 0.04]} />
+          <meshBasicMaterial color="#ef5350" />
+        </mesh>
+
+      </group>{/* end model group */}
     </group>
   );
 }
