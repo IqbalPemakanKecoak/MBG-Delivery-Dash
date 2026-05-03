@@ -1,57 +1,69 @@
 /**
  * useGameStore.ts
- * Central game state managed with Zustand.
- * Tracks phase, score, timer, missions, and schools.
+ * Central game state — Zustand store.
+ *
+ * Mission targeting fix:
+ *  • currentMissionIndex is the single source of truth for the active target.
+ *  • deliverPackage() only accepts the school that matches currentMissionIndex.
+ *  • After each delivery the timer resets and the index advances to the next
+ *    undelivered school (searching forward, wrapping around if needed).
+ *  • No out-of-order delivery is possible.
  */
 import { create } from 'zustand';
 
-// ── Game phases ──────────────────────────────────────────────────────────────
-export type GamePhase =
-  | 'intro'          // Opening narration before play
-  | 'playing'        // Active delivery mission
-  | 'midNarration'   // Reflective pause shown mid-game
-  | 'win'            // All packages delivered
-  | 'lose';          // Timer ran out
+export type GamePhase = 'intro' | 'playing' | 'midNarration' | 'win' | 'lose';
 
-// ── School / checkpoint data ─────────────────────────────────────────────────
 export interface School {
   id: number;
   name: string;
-  position: [number, number, number]; // World-space position
+  position: [number, number, number];
   delivered: boolean;
 }
 
-// ── The 5 schools spread across the small town ───────────────────────────────
 const INITIAL_SCHOOLS: School[] = [
-  { id: 0, name: 'SDN 01 Harapan',   position: [ 48,  0, -28], delivered: false },
-  { id: 1, name: 'SDN 02 Nusantara', position: [ 18,  0, -48], delivered: false },
-  { id: 2, name: 'SDN 03 Bangsa',    position: [-40,  0, -18], delivered: false },
-  { id: 3, name: 'SDN 04 Pancasila', position: [  8,  0,  42], delivered: false },
-  { id: 4, name: 'SDN 05 Merdeka',   position: [-28,  0, -40], delivered: false },
+  { id: 0, name: 'SDN 01 Harapan',   position: [ 48, 0, -28], delivered: false },
+  { id: 1, name: 'SDN 02 Nusantara', position: [ 18, 0, -48], delivered: false },
+  { id: 2, name: 'SDN 03 Bangsa',    position: [-40, 0, -18], delivered: false },
+  { id: 3, name: 'SDN 04 Pancasila', position: [  8, 0,  42], delivered: false },
+  { id: 4, name: 'SDN 05 Merdeka',   position: [-28, 0, -40], delivered: false },
 ];
 
-// Seconds allowed per delivery mission
-const MISSION_DURATION = 75;
+export const MISSION_DURATION = 75; // seconds per delivery
 
-// ── Store interface ──────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** Find the index of the next undelivered school after `from`, wrapping around. */
+function nextUndeliveredIndex(schools: School[], from: number): number {
+  const n = schools.length;
+  // Search forward from from+1
+  for (let offset = 1; offset < n; offset++) {
+    const i = (from + offset) % n;
+    if (!schools[i].delivered) return i;
+  }
+  return from; // all delivered (shouldn't happen before win check)
+}
+
+// ── Store interface ────────────────────────────────────────────────────────────
 interface GameStore {
   phase: GamePhase;
   score: number;
   timeLeft: number;
-  deliveryCount: number;           // How many packages delivered so far
-  currentMissionIndex: number;     // Which school we are heading to
+  deliveryCount: number;
+  currentMissionIndex: number;   // index into `schools` array — the ONLY active target
   schools: School[];
-  midNarrationShown: boolean;      // Guard so mid-narration shows only once
+  midNarrationShown: boolean;
 
   setPhase: (phase: GamePhase) => void;
   startGame: () => void;
   tickTimer: (delta: number) => void;
+  /** Attempt delivery. Silently ignored if schoolId ≠ schools[currentMissionIndex].id. */
   deliverPackage: (schoolId: number) => void;
+  /** Resume play after mid-game narration pause. */
   advanceMission: () => void;
   resetGame: () => void;
 }
 
-// ── Store implementation ─────────────────────────────────────────────────────
+// ── Store ──────────────────────────────────────────────────────────────────────
 export const useGameStore = create<GameStore>((set, get) => ({
   phase: 'intro',
   score: 0,
@@ -63,20 +75,17 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
   setPhase: (phase) => set({ phase }),
 
-  // Reset everything and begin the first mission
-  startGame: () =>
-    set({
-      phase: 'playing',
-      score: 0,
-      timeLeft: MISSION_DURATION,
-      deliveryCount: 0,
-      currentMissionIndex: 0,
-      schools: INITIAL_SCHOOLS.map(s => ({ ...s })),
-      midNarrationShown: false,
-    }),
+  startGame: () => set({
+    phase: 'playing',
+    score: 0,
+    timeLeft: MISSION_DURATION,
+    deliveryCount: 0,
+    currentMissionIndex: 0,
+    schools: INITIAL_SCHOOLS.map(s => ({ ...s })),
+    midNarrationShown: false,
+  }),
 
-  // Count down the timer each frame; losing when it hits 0
-  tickTimer: (delta: number) => {
+  tickTimer: (delta) => {
     const { phase, timeLeft } = get();
     if (phase !== 'playing') return;
     const next = timeLeft - delta;
@@ -87,57 +96,52 @@ export const useGameStore = create<GameStore>((set, get) => ({
     }
   },
 
-  // Mark a school as delivered and award points
-  deliverPackage: (schoolId: number) => {
-    const { schools, deliveryCount, timeLeft, midNarrationShown } = get();
-    const already = schools.find(s => s.id === schoolId)?.delivered;
-    if (already) return;
+  deliverPackage: (schoolId) => {
+    const { schools, currentMissionIndex, deliveryCount, timeLeft, midNarrationShown, score } = get();
 
-    const updated = schools.map(s =>
-      s.id === schoolId ? { ...s, delivered: true } : s
+    // ── Guard: only accept the ACTIVE target ──────────────────────────────────
+    const active = schools[currentMissionIndex];
+    if (!active || active.id !== schoolId || active.delivered) return;
+
+    // Mark it delivered
+    const updatedSchools = schools.map((s, i) =>
+      i === currentMissionIndex ? { ...s, delivered: true } : s
     );
-    const newCount = deliveryCount + 1;
-    const timeBonus = Math.floor(timeLeft * 2);
-    const newScore = get().score + 100 + timeBonus;
-    const allDone = newCount >= INITIAL_SCHOOLS.length;
 
-    // Show mid-game narration after the 2nd delivery
+    const newCount    = deliveryCount + 1;
+    const timeBonus   = Math.floor(timeLeft * 2);
+    const newScore    = score + 100 + timeBonus;
+    const allDone     = newCount >= INITIAL_SCHOOLS.length;
+
+    // Advance to next undelivered school (wrapping)
+    const nextIndex = allDone
+      ? currentMissionIndex
+      : nextUndeliveredIndex(updatedSchools, currentMissionIndex);
+
+    // Show mid-game narration after 2nd delivery (only once)
     const showMid = !midNarrationShown && newCount === 2;
 
     set({
-      schools: updated,
+      schools: updatedSchools,
       deliveryCount: newCount,
       score: newScore,
+      currentMissionIndex: nextIndex,
+      timeLeft: MISSION_DURATION,          // ← timer resets on every delivery
       phase: allDone ? 'win' : showMid ? 'midNarration' : 'playing',
       midNarrationShown: midNarrationShown || showMid,
     });
   },
 
-  // Start next mission: reset timer and advance index
-  advanceMission: () => {
-    const { currentMissionIndex, schools } = get();
-    // Find the next undelivered school
-    const nextIdx = schools.findIndex(
-      (s, i) => i > currentMissionIndex && !s.delivered
-    );
-    const resolvedIdx = nextIdx === -1
-      ? schools.findIndex(s => !s.delivered)
-      : nextIdx;
-    set({
-      currentMissionIndex: resolvedIdx === -1 ? currentMissionIndex : resolvedIdx,
-      timeLeft: MISSION_DURATION,
-      phase: 'playing',
-    });
-  },
+  // Called when player dismisses the mid-narration overlay
+  advanceMission: () => set({ phase: 'playing' }),
 
-  resetGame: () =>
-    set({
-      phase: 'intro',
-      score: 0,
-      timeLeft: MISSION_DURATION,
-      deliveryCount: 0,
-      currentMissionIndex: 0,
-      schools: INITIAL_SCHOOLS.map(s => ({ ...s })),
-      midNarrationShown: false,
-    }),
+  resetGame: () => set({
+    phase: 'intro',
+    score: 0,
+    timeLeft: MISSION_DURATION,
+    deliveryCount: 0,
+    currentMissionIndex: 0,
+    schools: INITIAL_SCHOOLS.map(s => ({ ...s })),
+    midNarrationShown: false,
+  }),
 }));

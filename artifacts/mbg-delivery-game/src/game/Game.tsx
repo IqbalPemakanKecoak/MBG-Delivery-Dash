@@ -1,12 +1,10 @@
 /**
  * Game.tsx
- * Main game canvas. Composes all subsystems:
- *  World → Trees → Checkpoints → Player → DayNightCycle → SoundManager
+ * Root game canvas. Composes all scene systems and HTML overlays.
  *
- * Shared refs (not reactive, updated every frame):
- *  • playerPosRef — THREE.Vector3 of truck position
- *  • playerYawRef — number, current facing angle in radians
- * These are passed to both Player (writer) and MiniMap/SoundManager (readers).
+ * Shared non-reactive refs (written by Player, read by overlays):
+ *   playerPosRef — THREE.Vector3  current truck position
+ *   playerYawRef — number         current facing angle (radians)
  */
 import { useRef } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
@@ -22,9 +20,9 @@ import { SoundManager } from './SoundManager';
 import { MiniMap } from './MiniMap';
 import { GameUI } from './GameUI';
 import { Narration } from './Narration';
+import { DirectionIndicator } from './DirectionIndicator';
 import { useGameStore } from './useGameStore';
 
-// ── Key mappings ──────────────────────────────────────────────────────────────
 const KEY_MAP = [
   { name: Controls.forward, keys: ['ArrowUp',    'KeyW'] },
   { name: Controls.back,    keys: ['ArrowDown',  'KeyS'] },
@@ -32,14 +30,13 @@ const KEY_MAP = [
   { name: Controls.right,   keys: ['ArrowRight', 'KeyD'] },
 ];
 
-// ── Timer ticker (lives inside Canvas so it has access to useFrame) ───────────
+// Timer lives inside Canvas so it can use useFrame
 function TimerTicker() {
   const { tickTimer } = useGameStore();
   useFrame((_, delta) => tickTimer(delta));
   return null;
 }
 
-// ── All Three.js scene objects ────────────────────────────────────────────────
 interface SceneProps {
   posRef: React.MutableRefObject<THREE.Vector3>;
   yawRef: React.MutableRefObject<number>;
@@ -59,9 +56,7 @@ function SceneContents({ posRef, yawRef }: SceneProps) {
   );
 }
 
-// ── Root Game component ───────────────────────────────────────────────────────
 export function Game() {
-  // Non-reactive refs — written by Player, read by MiniMap & SoundManager
   const playerPosRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 0));
   const playerYawRef = useRef<number>(0);
 
@@ -78,9 +73,10 @@ export function Game() {
         </Canvas>
       </KeyboardControls>
 
-      {/* ── HTML overlays ── */}
+      {/* HTML overlays — rendered over the canvas */}
       <GameUI />
       <MiniMap positionRef={playerPosRef} yawRef={playerYawRef} />
+      <DirectionIndicator positionRef={playerPosRef} yawRef={playerYawRef} />
       <Narration />
     </div>
   );
