@@ -1,20 +1,27 @@
 /**
  * Player.tsx — Delivery Truck
  *
- * Changes in this revision:
- *  • BUILDING_AABBS imported directly (single source of truth from World.tsx).
- *  • DELIVER_R tuned to 3.5 units.
- *  • Delivery only fires when schoolId === schools[currentMissionIndex].id —
- *    no out-of-order delivery possible.
- *  • Wheel rotation: 6 refs collected in an array, spun in the main useFrame
- *    proportional to velRef. One useFrame does everything.
+ * Vehicle feel improvements:
+ *  • Smooth steering: steerRef lerps toward ±1, giving a gradual turn-in/out.
+ *  • Inertia: ACCEL split into ACCEL_ON (throttle) and ACCEL_OFF (coast/brake)
+ *    so the truck has a natural rolling feel when you release the pedal.
+ *  • mobileInput is merged with keyboard getKeys() so both inputs work together.
+ *
+ * Wheel rotation:
+ *  • 6 group refs stored in wheelRefs array.
+ *  • Main useFrame spins them: rotation.x += (vel / WHEEL_R) * delta.
+ *
+ * Delivery:
+ *  • Only fires for schools[currentMissionIndex] — no out-of-order delivery.
+ *  • DELIVER_R = 3.5 units.
  */
 import { useRef, useEffect } from 'react';
 import { useFrame } from '@react-three/fiber';
 import { useKeyboardControls } from '@react-three/drei';
 import * as THREE from 'three';
 import { useGameStore } from './useGameStore';
-import { BUILDING_AABBS } from './World';           // ← single import, no fn call
+import { BUILDING_AABBS } from './World';
+import { mobileInput } from './mobileControls';
 
 export enum Controls {
   forward = 'forward',
@@ -23,14 +30,23 @@ export enum Controls {
   right   = 'right',
 }
 
-// ── Tuning constants ──────────────────────────────────────────────────────────
-const SPEED      = 12;    // forward speed  (units/s)
-const REVERSE    = 6;     // reverse speed  (units/s)
-const TURN_SPEED = 1.4;   // radians/s
-const ACCEL      = 4;     // velocity smoothing
-const DELIVER_R  = 3.5;   // delivery trigger radius (units)
+// ── Tuning ────────────────────────────────────────────────────────────────────
+const SPEED      = 12;    // max forward speed (units/s)
+const REVERSE    = 6;     // max reverse speed
+const TURN_SPEED = 1.5;   // max yaw rate (rad/s)
+const ACCEL_ON   = 5;     // throttle-on smoothing
+const ACCEL_OFF  = 2.5;   // coast / release inertia (lower = longer roll)
+const STEER_RATE = 7;     // steering smoothing (higher = sharper)
+const DELIVER_R  = 3.5;
 const MAP_LIMIT  = 65;
-const WHEEL_R    = 0.55;  // wheel radius for angular-velocity calculation
+const WHEEL_R    = 0.55;
+
+// ── Wheel positions in model-local space [x, z] ───────────────────────────────
+const WHEEL_POS: [number, number][] = [
+  [-1.7,  3.0], [ 1.7,  3.0],
+  [-1.7, -1.0], [ 1.7, -1.0],
+  [-1.7, -3.5], [ 1.7, -3.5],
+];
 
 // ── AABB collision resolver ───────────────────────────────────────────────────
 function resolveCollision(pos: THREE.Vector3, radius = 1.8): THREE.Vector3 {
@@ -54,28 +70,17 @@ function resolveCollision(pos: THREE.Vector3, radius = 1.8): THREE.Vector3 {
   return out;
 }
 
-// ── Wheel positions in model-local space [x, z] ───────────────────────────────
-// (model group is rotated Math.PI, so local +Z = world backward)
-const WHEEL_POSITIONS: [number, number][] = [
-  [-1.7,  3.0], [ 1.7,  3.0],   // front
-  [-1.7, -1.0], [ 1.7, -1.0],   // mid
-  [-1.7, -3.5], [ 1.7, -3.5],   // rear
-];
-
-// ── Props ──────────────────────────────────────────────────────────────────────
+// ── Props ─────────────────────────────────────────────────────────────────────
 interface PlayerProps {
   positionRef: React.MutableRefObject<THREE.Vector3>;
   yawRef:      React.MutableRefObject<number>;
 }
 
 export function Player({ positionRef, yawRef }: PlayerProps) {
-  const groupRef   = useRef<THREE.Group>(null);     // physics / transform group
-  const velRef     = useRef(0);                     // current linear velocity
-
-  // Six wheel group refs — indexed to match WHEEL_POSITIONS
+  const groupRef   = useRef<THREE.Group>(null);
+  const velRef     = useRef(0);
+  const steerRef   = useRef(0);   // smooth steering value [-1, +1]
   const wheelRefs  = useRef<(THREE.Group | null)[]>(new Array(6).fill(null));
-
-  // Headlight spot targets
   const targetLRef = useRef<THREE.Group>(null);
   const targetRRef = useRef<THREE.Group>(null);
   const headLRef   = useRef<THREE.SpotLight>(null);
@@ -84,7 +89,6 @@ export function Player({ positionRef, yawRef }: PlayerProps) {
   const [, getKeys] = useKeyboardControls<Controls>();
   const { phase, schools, currentMissionIndex, deliverPackage } = useGameStore();
 
-  // Wire SpotLight.target after mount (must be Objects in the scene)
   useEffect(() => {
     if (headLRef.current && targetLRef.current)
       headLRef.current.target = targetLRef.current;
@@ -102,52 +106,64 @@ export function Player({ positionRef, yawRef }: PlayerProps) {
     const group = groupRef.current;
     if (!group) return;
 
-    const keys = getKeys();
+    const kb = getKeys();
 
-    // ── Turning (only when moving — natural truck steering) ─────────────────
+    // ── Merge keyboard + mobile input ────────────────────────────────────────
+    const fwd = kb.forward || mobileInput.forward;
+    const bwd = kb.back    || mobileInput.back;
+    const lft = kb.left    || mobileInput.left;
+    const rgt = kb.right   || mobileInput.right;
+
+    // ── Smooth steering [-1 = full right turn, +1 = full left turn] ─────────
+    const steerTarget = lft ? 1 : rgt ? -1 : 0;
+    steerRef.current += (steerTarget - steerRef.current) * Math.min(1, delta * STEER_RATE);
+
+    // Apply turn (only while moving for natural truck feel)
     if (Math.abs(velRef.current) > 0.3) {
       const dir = velRef.current > 0 ? 1 : -1;
-      if (keys.left)  yawRef.current += TURN_SPEED * delta * dir;
-      if (keys.right) yawRef.current -= TURN_SPEED * delta * dir;
+      yawRef.current += TURN_SPEED * delta * dir * steerRef.current;
     }
 
-    // ── Velocity ─────────────────────────────────────────────────────────────
-    const targetVel = keys.forward ? SPEED : keys.back ? -REVERSE : 0;
-    velRef.current += (targetVel - velRef.current) * Math.min(1, delta * ACCEL);
+    // ── Velocity with asymmetric inertia ─────────────────────────────────────
+    const targetVel = fwd ? SPEED : bwd ? -REVERSE : 0;
+    const accel = (Math.abs(targetVel) > Math.abs(velRef.current) || targetVel !== 0)
+      ? ACCEL_ON
+      : ACCEL_OFF;
+    velRef.current += (targetVel - velRef.current) * Math.min(1, delta * accel);
 
-    // ── Movement: forward = -Z when yaw=0 ───────────────────────────────────
-    const fwd = new THREE.Vector3(
+    // ── Movement ─────────────────────────────────────────────────────────────
+    const fwdVec = new THREE.Vector3(
       -Math.sin(yawRef.current),
       0,
       -Math.cos(yawRef.current),
     );
-    const candidate = group.position.clone().addScaledVector(fwd, velRef.current * delta);
+    const candidate = group.position.clone()
+      .addScaledVector(fwdVec, velRef.current * delta);
     candidate.y = 0;
     const resolved = resolveCollision(candidate);
 
     group.position.copy(resolved);
     group.rotation.y = yawRef.current;
 
-    // ── Wheel spin — angular velocity = linear velocity / wheel radius ───────
-    // Positive velocity → wheels spin forward (rotation.x increases)
-    const angularVel = (velRef.current / WHEEL_R) * delta;
-    for (const wRef of wheelRefs.current) {
-      if (wRef) wRef.rotation.x += angularVel;
+    // ── Wheel spin ────────────────────────────────────────────────────────────
+    const angVel = (velRef.current / WHEEL_R) * delta;
+    for (const w of wheelRefs.current) {
+      if (w) w.rotation.x += angVel;
     }
 
-    // ── Share position and yaw with HUD / MiniMap / SoundManager ────────────
+    // ── Share position ────────────────────────────────────────────────────────
     positionRef.current.copy(resolved);
 
-    // ── Camera — placed BEHIND the truck ────────────────────────────────────
-    const camOffset = new THREE.Vector3(
+    // ── Camera ───────────────────────────────────────────────────────────────
+    const camOff = new THREE.Vector3(
       Math.sin(yawRef.current) * 16,
       8,
       Math.cos(yawRef.current) * 16,
     );
-    state.camera.position.lerp(resolved.clone().add(camOffset), 0.07);
+    state.camera.position.lerp(resolved.clone().add(camOff), 0.07);
     state.camera.lookAt(resolved.x, 2.0, resolved.z);
 
-    // ── Delivery: ONLY fire for the current mission target ───────────────────
+    // ── Delivery (active target only) ────────────────────────────────────────
     const active = schools[currentMissionIndex];
     if (active && !active.delivered) {
       const dx = resolved.x - active.position[0];
@@ -160,10 +176,6 @@ export function Player({ positionRef, yawRef }: PlayerProps) {
 
   return (
     <group ref={groupRef} position={[0, 0, 0]}>
-      {/*
-       * Visual model rotated Math.PI so the cabin faces the movement direction.
-       * All meshes, wheels, and lights are children here.
-       */}
       <group rotation={[0, Math.PI, 0]}>
 
         {/* Chassis */}
@@ -177,12 +189,10 @@ export function Player({ positionRef, yawRef }: PlayerProps) {
           <boxGeometry args={[3.0, 3.2, 5.0]} />
           <meshLambertMaterial color="#ffffff" />
         </mesh>
-        {/* Blue branding stripe */}
         <mesh position={[0, 2.0, -4.11]}>
           <boxGeometry args={[2.8, 1.0, 0.04]} />
           <meshLambertMaterial color="#1565c0" />
         </mesh>
-        {/* Door edge lines */}
         <mesh position={[0, 0.58, -4.12]}>
           <boxGeometry args={[2.9, 0.06, 0.04]} />
           <meshLambertMaterial color="#bdbdbd" />
@@ -197,22 +207,18 @@ export function Player({ positionRef, yawRef }: PlayerProps) {
           <boxGeometry args={[3.0, 2.8, 2.4]} />
           <meshLambertMaterial color="#1565c0" />
         </mesh>
-        {/* Windshield */}
         <mesh position={[0, 2.4, 4.01]}>
           <boxGeometry args={[2.4, 1.2, 0.06]} />
           <meshLambertMaterial color="#b3e5fc" transparent opacity={0.7} />
         </mesh>
-        {/* Roof visor */}
         <mesh position={[0, 3.3, 3.5]}>
           <boxGeometry args={[3.1, 0.2, 1.6]} />
           <meshLambertMaterial color="#0d47a1" />
         </mesh>
-        {/* Bumper */}
         <mesh position={[0, 0.6, 4.05]}>
           <boxGeometry args={[3.1, 0.5, 0.2]} />
           <meshLambertMaterial color="#9e9e9e" />
         </mesh>
-        {/* Headlight lenses */}
         <mesh position={[-0.9, 1.2, 4.01]}>
           <boxGeometry args={[0.7, 0.35, 0.06]} />
           <meshBasicMaterial color="#fffde7" />
@@ -221,7 +227,6 @@ export function Player({ positionRef, yawRef }: PlayerProps) {
           <boxGeometry args={[0.7, 0.35, 0.06]} />
           <meshBasicMaterial color="#fffde7" />
         </mesh>
-        {/* Side mirrors */}
         <mesh position={[-1.65, 2.6, 3.2]}>
           <boxGeometry args={[0.3, 0.18, 0.5]} />
           <meshLambertMaterial color="#37474f" />
@@ -230,25 +235,22 @@ export function Player({ positionRef, yawRef }: PlayerProps) {
           <boxGeometry args={[0.3, 0.18, 0.5]} />
           <meshLambertMaterial color="#37474f" />
         </mesh>
-        {/* Exhaust */}
         <mesh position={[-1.6, 3.6, 1.5]}>
           <cylinderGeometry args={[0.1, 0.1, 2.5, 7]} />
           <meshLambertMaterial color="#616161" />
         </mesh>
 
-        {/* ── Six wheels — refs collected for rotation in useFrame ── */}
-        {WHEEL_POSITIONS.map(([wx, wz], i) => (
+        {/* Six wheels */}
+        {WHEEL_POS.map(([wx, wz], i) => (
           <group
             key={i}
             ref={el => { wheelRefs.current[i] = el; }}
             position={[wx, 0.55, wz]}
           >
-            {/* Tyre — cylinder lying along X axis */}
             <mesh rotation={[0, 0, Math.PI / 2]} castShadow>
               <cylinderGeometry args={[WHEEL_R, WHEEL_R, 0.42, 14]} />
               <meshLambertMaterial color="#1a1a1a" />
             </mesh>
-            {/* Hub */}
             <mesh rotation={[0, 0, Math.PI / 2]}>
               <cylinderGeometry args={[0.28, 0.28, 0.44, 8]} />
               <meshLambertMaterial color="#bdbdbd" />
@@ -256,31 +258,14 @@ export function Player({ positionRef, yawRef }: PlayerProps) {
           </group>
         ))}
 
-        {/* ── Headlights (SpotLights as children = move with truck) ── */}
-        <spotLight
-          ref={headLRef}
-          position={[-0.9, 1.2, 4.1]}
-          angle={0.35}
-          penumbra={0.5}
-          intensity={6}
-          color="#fffde7"
-          distance={50}
-          castShadow
-          shadow-mapSize={[512, 512]}
-        />
+        {/* Headlights */}
+        <spotLight ref={headLRef} position={[-0.9, 1.2, 4.1]}
+          angle={0.35} penumbra={0.5} intensity={6} color="#fffde7"
+          distance={50} castShadow shadow-mapSize={[512, 512]} />
         <group ref={targetLRef} position={[-0.9, 0, 20]} />
-
-        <spotLight
-          ref={headRRef}
-          position={[0.9, 1.2, 4.1]}
-          angle={0.35}
-          penumbra={0.5}
-          intensity={6}
-          color="#fffde7"
-          distance={50}
-          castShadow
-          shadow-mapSize={[512, 512]}
-        />
+        <spotLight ref={headRRef} position={[0.9, 1.2, 4.1]}
+          angle={0.35} penumbra={0.5} intensity={6} color="#fffde7"
+          distance={50} castShadow shadow-mapSize={[512, 512]} />
         <group ref={targetRRef} position={[0.9, 0, 20]} />
 
         {/* Tail lights */}

@@ -1,10 +1,13 @@
 /**
  * Game.tsx
- * Root game canvas. Composes all scene systems and HTML overlays.
+ * Root game canvas. Wires all scene systems and HTML overlays.
  *
- * Shared non-reactive refs (written by Player, read by overlays):
- *   playerPosRef — THREE.Vector3  current truck position
- *   playerYawRef — number         current facing angle (radians)
+ * Overlays (outside Canvas, rendered over WebGL):
+ *   GameUI            — HUD, score, timer, checklist, win/lose screen
+ *   MiniMap           — canvas mini-map (top-right)
+ *   DirectionIndicator — compass arrow to target (bottom-center)
+ *   MobileControls    — joystick + gas/brake (bottom edges)
+ *   Narration         — story text overlays
  */
 import { useRef } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
@@ -21,6 +24,7 @@ import { MiniMap } from './MiniMap';
 import { GameUI } from './GameUI';
 import { Narration } from './Narration';
 import { DirectionIndicator } from './DirectionIndicator';
+import { MobileControls } from './MobileControls';
 import { useGameStore } from './useGameStore';
 
 const KEY_MAP = [
@@ -30,7 +34,6 @@ const KEY_MAP = [
   { name: Controls.right,   keys: ['ArrowRight', 'KeyD'] },
 ];
 
-// Timer lives inside Canvas so it can use useFrame
 function TimerTicker() {
   const { tickTimer } = useGameStore();
   useFrame((_, delta) => tickTimer(delta));
@@ -73,10 +76,11 @@ export function Game() {
         </Canvas>
       </KeyboardControls>
 
-      {/* HTML overlays — rendered over the canvas */}
+      {/* HTML overlays */}
       <GameUI />
-      <MiniMap positionRef={playerPosRef} yawRef={playerYawRef} />
+      <MiniMap     positionRef={playerPosRef} yawRef={playerYawRef} />
       <DirectionIndicator positionRef={playerPosRef} yawRef={playerYawRef} />
+      <MobileControls />
       <Narration />
     </div>
   );
